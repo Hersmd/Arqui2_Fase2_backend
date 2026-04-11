@@ -1,12 +1,19 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from app.config.database import db
 from datetime import datetime
+from pymongo.errors import PyMongoError
 
 router = APIRouter()
 
 @router.get("/state/latest")
 def get_latest_state():
-    state = db.state.find_one(sort=[("timestamp", -1)])
+    try:
+        state = db.state.find_one(sort=[("timestamp", -1)])
+    except PyMongoError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
+        ) from exc
     
     if state:
         state.pop("_id", None)
@@ -15,21 +22,43 @@ def get_latest_state():
 
 @router.get("/state/history")
 def get_state_history(limit: int = 50):
-    states = list(
-        db.state.find({}, {"_id": 0})
-        .sort("timestamp", -1)
-        .limit(limit)
-    )
-    return states
+    try:
+        states = list(
+            db.state.find({}, {"_id": 0})
+            .sort("timestamp", -1)
+            .limit(limit)
+        )
+        return states
+    except PyMongoError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
+        ) from exc
 
 @router.get("/state/parking")
 def get_parking_history(start: str, end: str):
-    states = list(db.state.find({
-        "timestamp": {
-            "$gte": datetime.fromisoformat(start),
-            "$lte": datetime.fromisoformat(end)
-        }
-    }))
+    try:
+        start_dt = datetime.fromisoformat(start)
+        end_dt = datetime.fromisoformat(end)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Formato de fecha inválido (use ISO 8601)") from exc
+
+    try:
+        states = list(
+            db.state.find(
+                {
+                    "timestamp": {
+                        "$gte": start_dt,
+                        "$lte": end_dt,
+                    }
+                }
+            )
+        )
+    except PyMongoError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
+        ) from exc
 
     resultado = []
 

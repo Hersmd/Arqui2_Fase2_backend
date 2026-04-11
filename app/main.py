@@ -29,6 +29,11 @@ app.add_middleware(
 # Evento de inicio: arrancar MQTT
 @app.on_event("startup")
 def startup_event():
+    if settings.MONGO_URI == "mongodb://localhost:27017":
+        print("[startup] MONGO_URI no está configurado (usando default local)")
+    else:
+        print(f"[startup] MONGO_URI configurado (redactado), DB_NAME={settings.DB_NAME}")
+
     if settings.ENABLE_MQTT:
         start_mqtt()
         print("MQTT service started!")

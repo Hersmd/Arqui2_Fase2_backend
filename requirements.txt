@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 pymongo
+dnspython
 paho-mqtt
 python-dotenv
 pydantic-settings

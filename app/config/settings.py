@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     MONGO_URI: str = "mongodb://localhost:27017"
     DB_NAME: str = "ecosort"
 
+    # Timeouts para evitar que la API se quede colgada si Mongo no está accesible
+    MONGO_SERVER_SELECTION_TIMEOUT_MS: int = 5000
+    MONGO_CONNECT_TIMEOUT_MS: int = 5000
+
     MQTT_BROKER: str = "broker.hivemq.com"
     MQTT_PORT: int = 1883
 
