@@ -8,7 +8,7 @@ from app.schemas.state_schema import State
 from datetime import datetime
 from app.schemas.alert_schema import Alert
 from app.config.settings import settings
-from typing import Any
+from typing import Any, List
 
 
 def _ensure_datetime(value):
@@ -95,7 +95,7 @@ def _normalize_state_payload(data: dict) -> dict:
             cur = cur[part]
         return cur
 
-    def _first(obj: dict, paths: list[str]):
+    def _first(obj: dict, paths: List[str]):
         for p in paths:
             v = _get(obj, p)
             if v is not None:
@@ -182,7 +182,7 @@ def _normalize_state_payload(data: dict) -> dict:
             "bin_plastico_full": _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]),
             "bin_vidrio_full": _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]),
             "bin_metal_full": _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]),
-            "smoke_alarm": _first(data, ["humo", "alarmaHumo", "alarmaActiva", "smoke_alarm"]),
+            "smoke_alarm": _first(data, ["alarmaHumoActiva", "alarmaHumo", "humo", "smoke_alarm", "alarmaActiva"]),
             "emergency": _first(data, ["emergencia", "emergency"]),
             "timestamp": _ensure_datetime(data.get("timestamp")),
         }

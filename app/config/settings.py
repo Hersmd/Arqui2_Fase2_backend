@@ -43,4 +43,10 @@ class Settings(BaseSettings):
     LOG_MONGO_INSERTS: bool = True
     LOG_MONGO_INSERTS_MAX_CHARS: int = 2000
 
+    # Auth simple (demo): usuario admin por defecto (configurable por env)
+    DEFAULT_ADMIN_USERNAME: str = "admin"
+    DEFAULT_ADMIN_PASSWORD: str = "1234"
+    # Si es True, al intentar login con el admin por defecto y no existir en Mongo, se crea.
+    AUTO_CREATE_DEFAULT_ADMIN: bool = True
+
 settings = Settings()
