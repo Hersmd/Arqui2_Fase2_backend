@@ -76,6 +76,57 @@ def _normalize_state_payload(data: dict) -> dict:
     if not isinstance(data, dict):
         raise ValueError("state payload no es dict")
 
+    def _bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "t", "yes", "y", "on", "open", "up"}
+        return bool(value)
+
+    def _get(obj: dict, path: str):
+        cur = obj
+        for part in path.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return None
+            cur = cur[part]
+        return cur
+
+    def _first(obj: dict, paths: list[str]):
+        for p in paths:
+            v = _get(obj, p)
+            if v is not None:
+                return v
+        return None
+
+    def _to_mode(value) -> str:
+        if value is None:
+            return "unknown"
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if v in {"on", "encendido", "encendida"}:
+                return "on"
+            if v in {"off", "apagado", "apagada"}:
+                return "off"
+            if v in {"auto", "automatico", "automático"}:
+                return "auto"
+            if v in {"unknown", "desconocido", "desconocida"}:
+                return "unknown"
+        return str(value)
+
+    def _to_motion(value, mapping: dict[str, str], default: str = "unknown") -> str:
+        if value is None:
+            return default
+        if isinstance(value, str):
+            v = value.strip().lower()
+            return mapping.get(v, default)
+        if isinstance(value, bool):
+            return mapping.get("true" if value else "false", default)
+        return default
+
     # Formato del script de Raspberry
     if "puertaAbierta" in data and "parqueosOcupados" in data:
         total = int(data.get("totalParqueos") or 0)
@@ -88,15 +139,102 @@ def _normalize_state_payload(data: dict) -> dict:
             occupied = total
 
         parking = ([True] * occupied) + ([False] * (total - occupied))
-        door = "open" if bool(data.get("puertaAbierta")) else "closed"
-        conveyor = "on" if bool(data.get("bandaPrincipal")) else "off"
+
+        door = "open" if _bool(data.get("puertaAbierta")) else "closed"
+
+        barrier_bool = _first(
+            data,
+            [
+                "talanqueraAbierta",
+                "barreraArriba",
+                "barrierUp",
+            ],
+        )
+        barrier = "up" if _bool(barrier_bool) else "down" if barrier_bool is not None else "unknown"
+
+        conveyor_principal = "running" if _bool(_first(data, ["bandaPrincipal", "banda_principal"])) else "stopped"
+        conveyor_plastico = "running" if _bool(_first(data, ["bandaPlastico", "banda_plastico"])) else "stopped"
+        conveyor_vidrio = "running" if _bool(_first(data, ["bandaVidrio", "banda_vidrio"])) else "stopped"
+        conveyor_metal = "running" if _bool(_first(data, ["bandaMetal", "banda_metal"])) else "stopped"
+
+        lighting = _to_mode(
+            _first(
+                data,
+                [
+                    "luz",
+                    "iluminacion",
+                    "modoIluminacion",
+                    "lighting",
+                ],
+            )
+        )
 
         return {
             "parking": parking,
             "door": door,
-            "barrier": "unknown",
-            "conveyor": conveyor,
-            "lighting": "unknown",
+            "barrier": barrier,
+            "conveyor": conveyor_principal,
+            "lighting": lighting,
+            "conveyor_principal": conveyor_principal,
+            "conveyor_plastico": conveyor_plastico,
+            "conveyor_vidrio": conveyor_vidrio,
+            "conveyor_metal": conveyor_metal,
+            "bin_plastico_full": _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]),
+            "bin_vidrio_full": _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]),
+            "bin_metal_full": _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]),
+            "smoke_alarm": _first(data, ["humo", "alarmaHumo", "alarmaActiva", "smoke_alarm"]),
+            "emergency": _first(data, ["emergencia", "emergency"]),
+            "timestamp": _ensure_datetime(data.get("timestamp")),
+        }
+
+    # Formato Arduino (JSON crudo) - intenta mapear si viene con secciones típicas
+    if isinstance(data.get("access_control"), dict) or isinstance(data.get("system_global"), dict) or isinstance(data.get("sorting_plant"), dict):
+        access = data.get("access_control") if isinstance(data.get("access_control"), dict) else {}
+        global_ = data.get("system_global") if isinstance(data.get("system_global"), dict) else {}
+        plant = data.get("sorting_plant") if isinstance(data.get("sorting_plant"), dict) else {}
+
+        door_bool = _first(access, ["door_open", "doorOpen", "puerta_abierta", "puertaAbierta"])
+        barrier_bool = _first(access, ["barrier_up", "barrierUp", "talanquera_abierta", "talanqueraAbierta"])
+        lighting_mode = _first(global_, ["lighting", "lighting_mode", "light", "luz", "modoIluminacion"])
+        smoke = _first(global_, ["smoke", "smoke_alarm", "alarmaHumo", "humo"])
+        emergency = _first(global_, ["emergency", "emergencia"])
+
+        # Líneas / bandas
+        principal = _first(plant, ["main_conveyor", "banda_principal", "bandaPrincipal", "conveyor"])
+        plastico = _first(plant, ["plastic_conveyor", "banda_plastico", "bandaPlastico"])
+        vidrio = _first(plant, ["glass_conveyor", "banda_vidrio", "bandaVidrio"])
+        metal = _first(plant, ["metal_conveyor", "banda_metal", "bandaMetal"])
+
+        conveyor_principal = _to_motion(principal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"})
+        conveyor_plastico = _to_motion(plastico, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+        conveyor_vidrio = _to_motion(vidrio, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+        conveyor_metal = _to_motion(metal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+
+        # Parking puede venir como lista o como (ocupados,total)
+        parking_list = data.get("parking") if isinstance(data.get("parking"), list) else None
+        if parking_list is None:
+            total = _first(data, ["totalParqueos", "total_parqueos", "parking_total"]) or 0
+            occupied = _first(data, ["parqueosOcupados", "parqueos_ocupados", "parking_occupied"]) or 0
+            try:
+                total_i = int(total)
+                occupied_i = int(occupied)
+            except Exception:
+                total_i = 0
+                occupied_i = 0
+            parking_list = ([True] * max(0, min(occupied_i, total_i))) + ([False] * max(0, total_i - occupied_i))
+
+        return {
+            "parking": parking_list,
+            "door": "open" if _bool(door_bool) else "closed" if door_bool is not None else "unknown",
+            "barrier": "up" if _bool(barrier_bool) else "down" if barrier_bool is not None else "unknown",
+            "conveyor": conveyor_principal,
+            "lighting": _to_mode(lighting_mode),
+            "conveyor_principal": conveyor_principal,
+            "conveyor_plastico": conveyor_plastico,
+            "conveyor_vidrio": conveyor_vidrio,
+            "conveyor_metal": conveyor_metal,
+            "smoke_alarm": smoke,
+            "emergency": emergency,
             "timestamp": _ensure_datetime(data.get("timestamp")),
         }
 
