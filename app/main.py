@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.config.settings import settings
 
 # Importa todas las rutas
-from app.routes import events, kpis, state, auth, metrics
+from app.routes import events, kpis, state, auth, metrics, health
 
 # Crea la instancia de FastAPI
 app = FastAPI(title="EcoSort Backend")
@@ -18,6 +18,7 @@ app.include_router(state.router, prefix="/api")
 app.include_router(auth.router, prefix="/api")
 app.include_router(control.router, prefix="/api")
 app.include_router(metrics.router, prefix="/api")
+app.include_router(health.router, prefix="/api")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -31,6 +32,8 @@ app.add_middleware(
 def startup_event():
     if settings.MONGO_URI == "mongodb://localhost:27017":
         print("[startup] MONGO_URI no está configurado (usando default local)")
+    elif "USUARIO:CONTRASENA" in settings.MONGO_URI:
+        print("[startup] MONGO_URI parece tener placeholder (USUARIO:CONTRASENA). Revisa variables de entorno en Render")
     else:
         print(f"[startup] MONGO_URI configurado (redactado), DB_NAME={settings.DB_NAME}")
 

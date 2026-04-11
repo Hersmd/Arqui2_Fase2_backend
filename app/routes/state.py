@@ -10,6 +10,7 @@ def get_latest_state():
     try:
         state = db.state.find_one(sort=[("timestamp", -1)])
     except PyMongoError as exc:
+        print(f"[mongo] /state/latest error: {type(exc).__name__}: {exc}")
         raise HTTPException(
             status_code=503,
             detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
@@ -17,6 +18,15 @@ def get_latest_state():
     
     if state:
         state.pop("_id", None)
+
+        # Compatibilidad: documentos viejos pueden no tener todos los campos.
+        # Devolvemos siempre las llaves esperadas por el frontend.
+        state.setdefault("parking", [])
+        state.setdefault("door", "unknown")
+        state.setdefault("barrier", "unknown")
+        state.setdefault("conveyor", "unknown")
+        state.setdefault("lighting", "unknown")
+        state.setdefault("timestamp", datetime.utcnow())
     
     return state or {}
 
@@ -30,6 +40,7 @@ def get_state_history(limit: int = 50):
         )
         return states
     except PyMongoError as exc:
+        print(f"[mongo] /state/history error: {type(exc).__name__}: {exc}")
         raise HTTPException(
             status_code=503,
             detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
@@ -55,6 +66,7 @@ def get_parking_history(start: str, end: str):
             )
         )
     except PyMongoError as exc:
+        print(f"[mongo] /state/parking error: {type(exc).__name__}: {exc}")
         raise HTTPException(
             status_code=503,
             detail="MongoDB no disponible (revisar MONGO_URI/DB_NAME en el backend)",
