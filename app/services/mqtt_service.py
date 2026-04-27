@@ -127,6 +127,73 @@ def _normalize_state_payload(data: dict) -> dict:
             return mapping.get("true" if value else "false", default)
         return default
 
+    def _status_to_motion(value) -> str:
+        if value is None:
+            return "unknown"
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if any(token in v for token in ["avanz", "clasific", "horne", "compact", "prensa", "running", "on"]):
+                return "running"
+            if any(token in v for token in ["deten", "paro", "stop", "stopped", "off"]):
+                return "stopped"
+        return "unknown"
+
+    def _status_to_door(value) -> str:
+        if value is None:
+            return "unknown"
+        if isinstance(value, str):
+            v = value.strip().lower()
+            if "abiert" in v or "open" in v:
+                return "open"
+            if "cerrad" in v or "close" in v:
+                return "closed"
+        if isinstance(value, bool):
+            return "open" if value else "closed"
+        return "unknown"
+
+    def _parking_from_capacity(occupied_value, total_value):
+        try:
+            total_i = int(total_value or 0)
+            occupied_i = int(occupied_value or 0)
+        except Exception:
+            total_i = 0
+            occupied_i = 0
+
+        if total_i < 0:
+            total_i = 0
+        if occupied_i < 0:
+            occupied_i = 0
+        if occupied_i > total_i:
+            occupied_i = total_i
+
+        return ([True] * occupied_i) + ([False] * (total_i - occupied_i))
+
+    def _parking_from_map(raw_map: str):
+        if not isinstance(raw_map, str):
+            return None
+        tokens = [t.strip() for t in raw_map.replace("|", " ").split() if t.strip()]
+        if not tokens:
+            return None
+        parking = []
+        for tok in tokens:
+            if "x" in tok.lower():
+                parking.append(True)
+            elif "[" in tok or "]" in tok:
+                parking.append(False)
+        return parking or None
+
+    def _timestamp_from_ms(value):
+        if value is None:
+            return None
+        try:
+            ms = int(value)
+        except Exception:
+            return None
+        # If looks like epoch milliseconds, convert. Otherwise fallback to now.
+        if ms >= 10**12:
+            return datetime.utcfromtimestamp(ms / 1000.0)
+        return datetime.utcnow()
+
     # Formato del script de Raspberry
     if "puertaAbierta" in data and "parqueosOcupados" in data:
         total = int(data.get("totalParqueos") or 0)
@@ -187,55 +254,83 @@ def _normalize_state_payload(data: dict) -> dict:
             "timestamp": _ensure_datetime(data.get("timestamp")),
         }
 
-    # Formato Arduino (JSON crudo) - intenta mapear si viene con secciones típicas
+    # Formato Arduino (JSON crudo) - intenta mapear si viene con secciones tipicas
     if isinstance(data.get("access_control"), dict) or isinstance(data.get("system_global"), dict) or isinstance(data.get("sorting_plant"), dict):
         access = data.get("access_control") if isinstance(data.get("access_control"), dict) else {}
         global_ = data.get("system_global") if isinstance(data.get("system_global"), dict) else {}
         plant = data.get("sorting_plant") if isinstance(data.get("sorting_plant"), dict) else {}
 
         door_bool = _first(access, ["door_open", "doorOpen", "puerta_abierta", "puertaAbierta"])
+        door_status = _first(access, ["door_status", "doorStatus", "estado_puerta", "estadoPuerta"])
         barrier_bool = _first(access, ["barrier_up", "barrierUp", "talanquera_abierta", "talanqueraAbierta"])
+        barrier_open = _first(access, ["parking_barrier_open", "barrier_open", "barrierOpen"])
         lighting_mode = _first(global_, ["lighting", "lighting_mode", "light", "luz", "modoIluminacion"])
         smoke = _first(global_, ["smoke", "smoke_alarm", "alarmaHumo", "humo"])
-        emergency = _first(global_, ["emergency", "emergencia"])
+        emergency = _first(global_, ["emergency", "emergencia", "emergency_active"])
+        smoke_raw = _first(global_, ["smoke_raw_value", "smokeRawValue", "humo_raw", "humoRaw"])
 
         # Líneas / bandas
-        principal = _first(plant, ["main_conveyor", "banda_principal", "bandaPrincipal", "conveyor"])
-        plastico = _first(plant, ["plastic_conveyor", "banda_plastico", "bandaPlastico"])
-        vidrio = _first(plant, ["glass_conveyor", "banda_vidrio", "bandaVidrio"])
-        metal = _first(plant, ["metal_conveyor", "banda_metal", "bandaMetal"])
+        principal = _first(plant, ["main_conveyor", "banda_principal", "bandaPrincipal", "conveyor", "main_belt_status"])
+        plastico = _first(plant, ["plastic_conveyor", "banda_plastico", "bandaPlastico", "plastic_belt.status"])
+        vidrio = _first(plant, ["glass_conveyor", "banda_vidrio", "bandaVidrio", "glass_belt.status"])
+        metal = _first(plant, ["metal_conveyor", "banda_metal", "bandaMetal", "metal_belt.status"])
+
+        glass_belt = plant.get("glass_belt") if isinstance(plant.get("glass_belt"), dict) else {}
+        metal_belt = plant.get("metal_belt") if isinstance(plant.get("metal_belt"), dict) else {}
+        plastic_belt = plant.get("plastic_belt") if isinstance(plant.get("plastic_belt"), dict) else {}
 
         conveyor_principal = _to_motion(principal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"})
+        if conveyor_principal == "unknown":
+            conveyor_principal = _status_to_motion(principal)
+
         conveyor_plastico = _to_motion(plastico, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+        if conveyor_plastico == "unknown":
+            conveyor_plastico = _status_to_motion(plastico)
+
         conveyor_vidrio = _to_motion(vidrio, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+        if conveyor_vidrio == "unknown":
+            conveyor_vidrio = _status_to_motion(vidrio)
+
         conveyor_metal = _to_motion(metal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
+        if conveyor_metal == "unknown":
+            conveyor_metal = _status_to_motion(metal)
 
         # Parking puede venir como lista o como (ocupados,total)
         parking_list = data.get("parking") if isinstance(data.get("parking"), list) else None
         if parking_list is None:
-            total = _first(data, ["totalParqueos", "total_parqueos", "parking_total"]) or 0
-            occupied = _first(data, ["parqueosOcupados", "parqueos_ocupados", "parking_occupied"]) or 0
-            try:
-                total_i = int(total)
-                occupied_i = int(occupied)
-            except Exception:
-                total_i = 0
-                occupied_i = 0
-            parking_list = ([True] * max(0, min(occupied_i, total_i))) + ([False] * max(0, total_i - occupied_i))
+            total = _first(data, ["totalParqueos", "total_parqueos", "parking_total"]) or _first(access, ["parking_capacity", "parkingCapacity"]) or 0
+            occupied = _first(data, ["parqueosOcupados", "parqueos_ocupados", "parking_occupied"]) or _first(access, ["parking_occupied", "parkingOccupied"]) or 0
+            parking_list = _parking_from_capacity(occupied, total)
+
+        if parking_list is None:
+            parking_list = _parking_from_map(_first(access, ["parking_map", "parkingMap"]) or "")
+
+        if parking_list is None:
+            parking_list = []
+
+        timestamp = _ensure_datetime(data.get("timestamp"))
+        if data.get("timestamp") is None:
+            ts_ms = data.get("timestamp_ms") or _first(global_, ["timestamp_ms", "timestampMs"])
+            ts_from_ms = _timestamp_from_ms(ts_ms)
+            if ts_from_ms is not None:
+                timestamp = ts_from_ms
 
         return {
             "parking": parking_list,
-            "door": "open" if _bool(door_bool) else "closed" if door_bool is not None else "unknown",
-            "barrier": "up" if _bool(barrier_bool) else "down" if barrier_bool is not None else "unknown",
+            "door": _status_to_door(door_status) if door_status is not None else ("open" if _bool(door_bool) else "closed" if door_bool is not None else "unknown"),
+            "barrier": "up" if _bool(barrier_open if barrier_open is not None else barrier_bool) else "down" if (barrier_open is not None or barrier_bool is not None) else "unknown",
             "conveyor": conveyor_principal,
             "lighting": _to_mode(lighting_mode),
             "conveyor_principal": conveyor_principal,
             "conveyor_plastico": conveyor_plastico,
             "conveyor_vidrio": conveyor_vidrio,
             "conveyor_metal": conveyor_metal,
-            "smoke_alarm": smoke,
+            "bin_plastico_full": _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]) if _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]) is not None else plastic_belt.get("bin_full"),
+            "bin_vidrio_full": _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]) if _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]) is not None else glass_belt.get("bin_full"),
+            "bin_metal_full": _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]) if _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]) is not None else metal_belt.get("bin_full"),
+            "smoke_alarm": smoke if smoke is not None else (bool(smoke_raw) if smoke_raw is not None else None),
             "emergency": emergency,
-            "timestamp": _ensure_datetime(data.get("timestamp")),
+            "timestamp": timestamp,
         }
 
     # Formato ya compatible
