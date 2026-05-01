@@ -3,13 +3,15 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
 
 from app.config.database import db
 
 router = APIRouter()
 
 BucketUnit = Literal["minute", "hour", "day"]
+
+_epp_indexes_ready = False
 
 
 def _parse_iso_datetime(value: str) -> datetime:
@@ -30,6 +32,211 @@ def _parse_iso_datetime(value: str) -> datetime:
 def _date_trunc_unit(unit: BucketUnit) -> str:
     # Mongo expects 'minute'|'hour'|'day'
     return unit
+
+
+def _ensure_epp_indexes() -> None:
+    """Create indexes once to keep Grafana range queries fast."""
+    global _epp_indexes_ready
+    if _epp_indexes_ready:
+        return
+
+    try:
+        db.epp_verifications.create_index([("timestamp", 1)])
+        db.epp_verifications.create_index([("timestamp", 1), ("acceso_permitido", 1)])
+        db.epp_verifications.create_index([("timestamp", 1), ("ultimo_resultado", 1)])
+    finally:
+        _epp_indexes_ready = True
+
+
+@router.get("/metrics/epp_verifications")
+def epp_verifications(
+    start: str,
+    end: str,
+    bucket: BucketUnit = "minute",
+):
+    """Aggregated EPP verification metrics for Grafana.
+
+    Output rows:
+    - {ts, type: "success", count}
+    - {ts, type: "failed",  count}
+    - {ts, type: "total",   count}
+    """
+    start_dt = _parse_iso_datetime(start)
+    end_dt = _parse_iso_datetime(end)
+
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="'end' must be greater than or equal to 'start'")
+
+    _ensure_epp_indexes()
+
+    unit = _date_trunc_unit(bucket)
+
+    pipeline = [
+        {
+            "$match": {
+                "timestamp": {"$gte": start_dt, "$lte": end_dt},
+            }
+        },
+        {
+            "$project": {
+                "ts_bucket": {
+                    "$dateTrunc": {
+                        "date": "$timestamp",
+                        "unit": unit,
+                        "timezone": "UTC",
+                    }
+                },
+                "is_success": {
+                    "$or": [
+                        {"$eq": ["$acceso_permitido", True]},
+                        {"$eq": ["$ultimo_resultado", "helmet_detected"]},
+                    ]
+                },
+            }
+        },
+        {
+            "$group": {
+                "_id": {
+                    "ts": "$ts_bucket",
+                    "type": {
+                        "$cond": ["$is_success", "success", "failed"]
+                    },
+                },
+                "count": {"$sum": 1},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$_id.ts",
+                "success": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$_id.type", "success"]},
+                            "$count",
+                            0,
+                        ]
+                    }
+                },
+                "failed": {
+                    "$sum": {
+                        "$cond": [
+                            {"$eq": ["$_id.type", "failed"]},
+                            "$count",
+                            0,
+                        ]
+                    }
+                },
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "ts": "$_id",
+                "rows": [
+                    {"type": "success", "count": "$success"},
+                    {"type": "failed", "count": "$failed"},
+                    {"type": "total", "count": {"$add": ["$success", "$failed"]}},
+                ],
+            }
+        },
+        {"$unwind": "$rows"},
+        {
+            "$project": {
+                "ts": {
+                    "$dateToString": {
+                        "date": "$ts",
+                        "format": "%Y-%m-%dT%H:%M:%S.%LZ",
+                        "timezone": "UTC",
+                    }
+                },
+                "type": "$rows.type",
+                "count": "$rows.count",
+            }
+        },
+        {
+            "$addFields": {
+                "type_order": {
+                    "$switch": {
+                        "branches": [
+                            {"case": {"$eq": ["$type", "success"]}, "then": 1},
+                            {"case": {"$eq": ["$type", "failed"]}, "then": 2},
+                            {"case": {"$eq": ["$type", "total"]}, "then": 3},
+                        ],
+                        "default": 99,
+                    }
+                }
+            }
+        },
+        {"$sort": {"ts": 1, "type_order": 1}},
+        {"$project": {"type_order": 0}},
+    ]
+
+    return list(db.epp_verifications.aggregate(pipeline))
+
+
+@router.get("/metrics/plate_recognition")
+def plate_recognition(
+    start: str,
+    end: str,
+    bucket: BucketUnit = "minute",
+):
+    """Plate recognition metrics over time.
+
+    Output rows:
+    - {ts, type: "authorized", count}
+    - {ts, type: "not_authorized", count}
+    - {ts, type: "failed", count}
+    """
+    start_dt = _parse_iso_datetime(start)
+    end_dt = _parse_iso_datetime(end)
+
+    if end_dt < start_dt:
+        raise HTTPException(status_code=400, detail="'end' must be greater than or equal to 'start'")
+
+    _ensure_epp_indexes()
+
+    unit = _date_trunc_unit(bucket)
+
+    pipeline = [
+        {"$match": {"timestamp": {"$gte": start_dt, "$lte": end_dt}}},
+        {
+            "$project": {
+                "ts": {"$dateTrunc": {"date": "$timestamp", "unit": unit, "timezone": "UTC"}},
+                "detected_len": {"$strLenCP": {"$ifNull": ["$detected_text", ""]}},
+                "authorized": {"$ifNull": ["$authorized", False]},
+            }
+        },
+        {
+            "$group": {
+                "_id": "$ts",
+                "authorized": {"$sum": {"$cond": [{"$and": [{"$gt": ["$detected_len", 0]}, {"$eq": ["$authorized", True]}]}, 1, 0]}},
+                "not_authorized": {"$sum": {"$cond": [{"$and": [{"$gt": ["$detected_len", 0]}, {"$eq": ["$authorized", False]}]}, 1, 0]}},
+                "failed": {"$sum": {"$cond": [{"$eq": ["$detected_len", 0]}, 1, 0]}},
+            }
+        },
+        {
+            "$project": {
+                "_id": 0,
+                "ts": "$_id",
+                "rows": [
+                    {"type": "authorized", "count": "$authorized"},
+                    {"type": "not_authorized", "count": "$not_authorized"},
+                    {"type": "failed", "count": "$failed"},
+                ],
+            }
+        },
+        {"$unwind": "$rows"},
+        {
+            "$project": {
+                "ts": {"$dateToString": {"date": "$ts", "format": "%Y-%m-%dT%H:%M:%S.%LZ", "timezone": "UTC"}},
+                "type": "$rows.type",
+                "count": "$rows.count",
+            }
+        },
+        {"$sort": {"ts": 1, "type": 1}},
+    ]
+
+    return list(db.plate_logs.aggregate(pipeline))
 
 
 @router.get("/metrics/materials_by_line")
