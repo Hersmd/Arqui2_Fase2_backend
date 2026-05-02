@@ -11,6 +11,10 @@ from app.config.settings import settings
 from typing import Any, List
 
 
+# ===============================
+# HELPERS INTERNOS
+# ===============================
+
 def _ensure_datetime(value):
     if isinstance(value, datetime):
         return value
@@ -33,10 +37,8 @@ def _jsonable(value: Any) -> Any:
         return [_jsonable(v) for v in value]
     if isinstance(value, (bytes, bytearray)):
         return value.hex()
-    # pymongo/bson ObjectId u otros objetos
     try:
         from bson import ObjectId  # type: ignore
-
         if isinstance(value, ObjectId):
             return str(value)
     except Exception:
@@ -67,11 +69,16 @@ def _log_mongo_insert(collection: str, inserted_id: Any, document: dict) -> None
     print(f"[MONGO][INSERT] {serialized}")
 
 
+# ===============================
+# NORMALIZACIÓN DE ESTADO
+# ===============================
+
 def _normalize_state_payload(data: dict) -> dict:
     """Normaliza distintos formatos de 'state' a lo esperado por `State`.
 
-    - Formato backend: {parking: [...], door: str, barrier: str, conveyor: str, lighting: str, timestamp: ISO/datetime}
-    - Formato script Raspberry: {puertaAbierta: bool, bandaPrincipal: bool, parqueosOcupados: int, totalParqueos: int, ...}
+    - Formato backend:    {parking: [...], door: str, barrier: str, conveyor: str, lighting: str, timestamp: ISO}
+    - Formato Raspberry:  {puertaAbierta: bool, bandaPrincipal: bool, parqueosOcupados: int, totalParqueos: int, ...}
+    - Formato Arduino:    {access_control: {...}, system_global: {...}, sorting_plant: {...}}
     """
     if not isinstance(data, dict):
         raise ValueError("state payload no es dict")
@@ -87,15 +94,19 @@ def _normalize_state_payload(data: dict) -> dict:
             return value.strip().lower() in {"1", "true", "t", "yes", "y", "on", "open", "up"}
         return bool(value)
 
-    def _get(obj: dict, path: str):
-        cur = obj
+    def _get(obj: dict | None, path: str):
+        if obj is None:
+            return None
+        cur: Any = obj
         for part in path.split("."):
             if not isinstance(cur, dict) or part not in cur:
                 return None
             cur = cur[part]
         return cur
 
-    def _first(obj: dict, paths: List[str]):
+    def _first(obj: dict | None, paths: List[str]):
+        if obj is None:
+            return None
         for p in paths:
             v = _get(obj, p)
             if v is not None:
@@ -117,12 +128,11 @@ def _normalize_state_payload(data: dict) -> dict:
                 return "unknown"
         return str(value)
 
-    def _to_motion(value, mapping: dict[str, str], default: str = "unknown") -> str:
+    def _to_motion(value, mapping: dict, default: str = "unknown") -> str:
         if value is None:
             return default
         if isinstance(value, str):
-            v = value.strip().lower()
-            return mapping.get(v, default)
+            return mapping.get(value.strip().lower(), default)
         if isinstance(value, bool):
             return mapping.get("true" if value else "false", default)
         return default
@@ -132,9 +142,9 @@ def _normalize_state_payload(data: dict) -> dict:
             return "unknown"
         if isinstance(value, str):
             v = value.strip().lower()
-            if any(token in v for token in ["avanz", "clasific", "horne", "compact", "prensa", "running", "on"]):
+            if any(t in v for t in ["avanz", "clasific", "horne", "compact", "prensa", "running", "on"]):
                 return "running"
-            if any(token in v for token in ["deten", "paro", "stop", "stopped", "off"]):
+            if any(t in v for t in ["deten", "paro", "stop", "stopped", "off"]):
                 return "stopped"
         return "unknown"
 
@@ -153,19 +163,11 @@ def _normalize_state_payload(data: dict) -> dict:
 
     def _parking_from_capacity(occupied_value, total_value):
         try:
-            total_i = int(total_value or 0)
-            occupied_i = int(occupied_value or 0)
+            total_i    = max(0, int(total_value    or 0))
+            occupied_i = max(0, int(occupied_value or 0))
+            occupied_i = min(occupied_i, total_i)
         except Exception:
-            total_i = 0
-            occupied_i = 0
-
-        if total_i < 0:
-            total_i = 0
-        if occupied_i < 0:
-            occupied_i = 0
-        if occupied_i > total_i:
-            occupied_i = total_i
-
+            return []
         return ([True] * occupied_i) + ([False] * (total_i - occupied_i))
 
     def _parking_from_map(raw_map: str):
@@ -189,52 +191,34 @@ def _normalize_state_payload(data: dict) -> dict:
             ms = int(value)
         except Exception:
             return None
-        # If looks like epoch milliseconds, convert. Otherwise fallback to now.
         if ms >= 10**12:
             return datetime.utcfromtimestamp(ms / 1000.0)
         return datetime.utcnow()
 
-    # Formato del script de Raspberry
+    CONVEYOR_MAP = {
+        "running": "running", "on": "running", "true": "running",
+        "stopped": "stopped", "off": "stopped", "false": "stopped",
+    }
+
+    # ── Formato Raspberry ──────────────────────────────────────────────────────
     if "puertaAbierta" in data and "parqueosOcupados" in data:
-        total = int(data.get("totalParqueos") or 0)
-        occupied = int(data.get("parqueosOcupados") or 0)
-        if total < 0:
-            total = 0
-        if occupied < 0:
-            occupied = 0
-        if occupied > total:
-            occupied = total
+        total    = int(data.get("totalParqueos", 0) or 0)
+        occupied = int(data.get("parqueosOcupados", 0) or 0)
+        total    = max(0, total)
+        occupied = max(0, min(occupied, total))
 
         parking = ([True] * occupied) + ([False] * (total - occupied))
+        door    = "open" if _bool(data.get("puertaAbierta")) else "closed"
 
-        door = "open" if _bool(data.get("puertaAbierta")) else "closed"
-
-        barrier_bool = _first(
-            data,
-            [
-                "talanqueraAbierta",
-                "barreraArriba",
-                "barrierUp",
-            ],
-        )
-        barrier = "up" if _bool(barrier_bool) else "down" if barrier_bool is not None else "unknown"
+        barrier_raw = _first(data, ["talanqueraAbierta", "barreraArriba", "barrierUp"])
+        barrier = "up" if _bool(barrier_raw) else ("down" if barrier_raw is not None else "unknown")
 
         conveyor_principal = "running" if _bool(_first(data, ["bandaPrincipal", "banda_principal"])) else "stopped"
-        conveyor_plastico = "running" if _bool(_first(data, ["bandaPlastico", "banda_plastico"])) else "stopped"
-        conveyor_vidrio = "running" if _bool(_first(data, ["bandaVidrio", "banda_vidrio"])) else "stopped"
-        conveyor_metal = "running" if _bool(_first(data, ["bandaMetal", "banda_metal"])) else "stopped"
+        conveyor_plastico  = "running" if _bool(_first(data, ["bandaPlastico",  "banda_plastico"]))  else "stopped"
+        conveyor_vidrio    = "running" if _bool(_first(data, ["bandaVidrio",    "banda_vidrio"]))    else "stopped"
+        conveyor_metal     = "running" if _bool(_first(data, ["bandaMetal",     "banda_metal"]))     else "stopped"
 
-        lighting = _to_mode(
-            _first(
-                data,
-                [
-                    "luz",
-                    "iluminacion",
-                    "modoIluminacion",
-                    "lighting",
-                ],
-            )
-        )
+        lighting = _to_mode(_first(data, ["luz", "iluminacion", "modoIluminacion", "lighting"]))
 
         return {
             "parking": parking,
@@ -243,71 +227,68 @@ def _normalize_state_payload(data: dict) -> dict:
             "conveyor": conveyor_principal,
             "lighting": lighting,
             "conveyor_principal": conveyor_principal,
-            "conveyor_plastico": conveyor_plastico,
-            "conveyor_vidrio": conveyor_vidrio,
-            "conveyor_metal": conveyor_metal,
+            "conveyor_plastico":  conveyor_plastico,
+            "conveyor_vidrio":    conveyor_vidrio,
+            "conveyor_metal":     conveyor_metal,
             "bin_plastico_full": _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]),
-            "bin_vidrio_full": _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]),
-            "bin_metal_full": _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]),
+            "bin_vidrio_full":   _first(data, ["bodegaVidrioLlena",   "bodega_vidrio_llena",   "bin_glass_full"]),
+            "bin_metal_full":    _first(data, ["bodegaMetalLlena",    "bodega_metal_llena",    "bin_metal_full"]),
             "smoke_alarm": _first(data, ["alarmaHumoActiva", "alarmaHumo", "humo", "smoke_alarm", "alarmaActiva"]),
-            "emergency": _first(data, ["emergencia", "emergency"]),
-            "timestamp": _ensure_datetime(data.get("timestamp")),
+            "emergency":   _first(data, ["emergencia", "emergency"]),
+            "timestamp":   _ensure_datetime(data.get("timestamp")),
         }
 
-    # Formato Arduino (JSON crudo) - intenta mapear si viene con secciones tipicas
-    if isinstance(data.get("access_control"), dict) or isinstance(data.get("system_global"), dict) or isinstance(data.get("sorting_plant"), dict):
-        access = data.get("access_control") if isinstance(data.get("access_control"), dict) else {}
-        global_ = data.get("system_global") if isinstance(data.get("system_global"), dict) else {}
-        plant = data.get("sorting_plant") if isinstance(data.get("sorting_plant"), dict) else {}
+    # ── Formato Arduino (secciones anidadas) ───────────────────────────────────
+    if (
+        isinstance(data.get("access_control"), dict)
+        or isinstance(data.get("system_global"), dict)
+        or isinstance(data.get("sorting_plant"), dict)
+    ):
+        access  = data.get("access_control") if isinstance(data.get("access_control"), dict) else {}
+        global_ = data.get("system_global")  if isinstance(data.get("system_global"),  dict) else {}
+        plant   = data.get("sorting_plant")  if isinstance(data.get("sorting_plant"),  dict) else {}
 
-        door_bool = _first(access, ["door_open", "doorOpen", "puerta_abierta", "puertaAbierta"])
-        door_status = _first(access, ["door_status", "doorStatus", "estado_puerta", "estadoPuerta"])
-        barrier_bool = _first(access, ["barrier_up", "barrierUp", "talanquera_abierta", "talanqueraAbierta"])
+        door_status  = _first(access, ["door_status",   "doorStatus",   "estado_puerta",  "estadoPuerta"])
+        door_bool    = _first(access, ["door_open",     "doorOpen",     "puerta_abierta", "puertaAbierta"])
         barrier_open = _first(access, ["parking_barrier_open", "barrier_open", "barrierOpen"])
-        lighting_mode = _first(global_, ["lighting", "lighting_mode", "light", "luz", "modoIluminacion"])
-        smoke = _first(global_, ["smoke", "smoke_alarm", "alarmaHumo", "humo"])
-        emergency = _first(global_, ["emergency", "emergencia", "emergency_active"])
-        smoke_raw = _first(global_, ["smoke_raw_value", "smokeRawValue", "humo_raw", "humoRaw"])
+        barrier_bool = _first(access, ["barrier_up",    "barrierUp",    "talanquera_abierta", "talanqueraAbierta"])
+        lighting_raw = _first(global_, ["lighting",     "lighting_mode","light", "luz", "modoIluminacion"])
+        smoke        = _first(global_, ["smoke",        "smoke_alarm",  "alarmaHumo", "humo"])
+        smoke_raw    = _first(global_, ["smoke_raw_value", "smokeRawValue", "humo_raw", "humoRaw"])
+        emergency    = _first(global_, ["emergency",    "emergencia",   "emergency_active"])
 
-        # Líneas / bandas
         principal = _first(plant, ["main_conveyor", "banda_principal", "bandaPrincipal", "conveyor", "main_belt_status"])
-        plastico = _first(plant, ["plastic_conveyor", "banda_plastico", "bandaPlastico", "plastic_belt.status"])
-        vidrio = _first(plant, ["glass_conveyor", "banda_vidrio", "bandaVidrio", "glass_belt.status"])
-        metal = _first(plant, ["metal_conveyor", "banda_metal", "bandaMetal", "metal_belt.status"])
+        plastico  = _first(plant, ["plastic_conveyor", "banda_plastico", "bandaPlastico", "plastic_belt.status"])
+        vidrio    = _first(plant, ["glass_conveyor",   "banda_vidrio",   "bandaVidrio",   "glass_belt.status"])
+        metal     = _first(plant, ["metal_conveyor",   "banda_metal",    "bandaMetal",    "metal_belt.status"])
 
-        glass_belt = plant.get("glass_belt") if isinstance(plant.get("glass_belt"), dict) else {}
-        metal_belt = plant.get("metal_belt") if isinstance(plant.get("metal_belt"), dict) else {}
-        plastic_belt = plant.get("plastic_belt") if isinstance(plant.get("plastic_belt"), dict) else {}
+        glass_belt:   dict[str, Any] = plant.get("glass_belt")   if isinstance(plant.get("glass_belt"),   dict) else {}
+        metal_belt:   dict[str, Any] = plant.get("metal_belt")   if isinstance(plant.get("metal_belt"),   dict) else {}
+        plastic_belt: dict[str, Any] = plant.get("plastic_belt") if isinstance(plant.get("plastic_belt"), dict) else {}
 
-        conveyor_principal = _to_motion(principal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"})
-        if conveyor_principal == "unknown":
-            conveyor_principal = _status_to_motion(principal)
+        def _resolve_conveyor(raw):
+            result = _to_motion(raw, CONVEYOR_MAP)
+            return result if result != "unknown" else _status_to_motion(raw)
 
-        conveyor_plastico = _to_motion(plastico, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
-        if conveyor_plastico == "unknown":
-            conveyor_plastico = _status_to_motion(plastico)
+        conveyor_principal = _resolve_conveyor(principal)
+        conveyor_plastico  = _resolve_conveyor(plastico)
+        conveyor_vidrio    = _resolve_conveyor(vidrio)
+        conveyor_metal     = _resolve_conveyor(metal)
 
-        conveyor_vidrio = _to_motion(vidrio, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
-        if conveyor_vidrio == "unknown":
-            conveyor_vidrio = _status_to_motion(vidrio)
-
-        conveyor_metal = _to_motion(metal, {"running": "running", "on": "running", "true": "running", "stopped": "stopped", "off": "stopped", "false": "stopped"}, default="unknown")
-        if conveyor_metal == "unknown":
-            conveyor_metal = _status_to_motion(metal)
-
-        # Parking puede venir como lista o como (ocupados,total)
+        # Parking
         parking_list = data.get("parking") if isinstance(data.get("parking"), list) else None
         if parking_list is None:
-            total = _first(data, ["totalParqueos", "total_parqueos", "parking_total"]) or _first(access, ["parking_capacity", "parkingCapacity"]) or 0
-            occupied = _first(data, ["parqueosOcupados", "parqueos_ocupados", "parking_occupied"]) or _first(access, ["parking_occupied", "parkingOccupied"]) or 0
+            total    = _first(data,   ["totalParqueos",    "total_parqueos",   "parking_total"]) \
+                    or _first(access, ["parking_capacity", "parkingCapacity"]) or 0
+            occupied = _first(data,   ["parqueosOcupados", "parqueos_ocupados","parking_occupied"]) \
+                    or _first(access, ["parking_occupied",  "parkingOccupied"]) or 0
             parking_list = _parking_from_capacity(occupied, total)
+        if not parking_list:
+            parking_list = _parking_from_map(
+                _first(access, ["parking_map", "parkingMap"]) or ""
+            ) or []
 
-        if parking_list is None:
-            parking_list = _parking_from_map(_first(access, ["parking_map", "parkingMap"]) or "")
-
-        if parking_list is None:
-            parking_list = []
-
+        # Timestamp
         timestamp = _ensure_datetime(data.get("timestamp"))
         if data.get("timestamp") is None:
             ts_ms = data.get("timestamp_ms") or _first(global_, ["timestamp_ms", "timestampMs"])
@@ -315,31 +296,46 @@ def _normalize_state_payload(data: dict) -> dict:
             if ts_from_ms is not None:
                 timestamp = ts_from_ms
 
+        def _bin(top_keys, belt_key):
+            v = _first(data, top_keys)
+            return v if v is not None else (
+                plastic_belt if belt_key == "plastic" else
+                glass_belt   if belt_key == "glass"   else
+                metal_belt
+            ).get("bin_full")
+
         return {
-            "parking": parking_list,
-            "door": _status_to_door(door_status) if door_status is not None else ("open" if _bool(door_bool) else "closed" if door_bool is not None else "unknown"),
-            "barrier": "up" if _bool(barrier_open if barrier_open is not None else barrier_bool) else "down" if (barrier_open is not None or barrier_bool is not None) else "unknown",
+            "parking":  parking_list,
+            "door":     _status_to_door(door_status) if door_status is not None
+                        else ("open" if _bool(door_bool) else "closed" if door_bool is not None else "unknown"),
+            "barrier":  "up"   if _bool(barrier_open if barrier_open is not None else barrier_bool)
+                        else   ("down" if (barrier_open is not None or barrier_bool is not None) else "unknown"),
             "conveyor": conveyor_principal,
-            "lighting": _to_mode(lighting_mode),
+            "lighting": _to_mode(lighting_raw),
             "conveyor_principal": conveyor_principal,
-            "conveyor_plastico": conveyor_plastico,
-            "conveyor_vidrio": conveyor_vidrio,
-            "conveyor_metal": conveyor_metal,
-            "bin_plastico_full": _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]) if _first(data, ["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"]) is not None else plastic_belt.get("bin_full"),
-            "bin_vidrio_full": _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]) if _first(data, ["bodegaVidrioLlena", "bodega_vidrio_llena", "bin_glass_full"]) is not None else glass_belt.get("bin_full"),
-            "bin_metal_full": _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]) if _first(data, ["bodegaMetalLlena", "bodega_metal_llena", "bin_metal_full"]) is not None else metal_belt.get("bin_full"),
+            "conveyor_plastico":  conveyor_plastico,
+            "conveyor_vidrio":    conveyor_vidrio,
+            "conveyor_metal":     conveyor_metal,
+            "bin_plastico_full": _bin(["bodegaPlasticoLlena", "bodega_plastico_llena", "bin_plastic_full"], "plastic"),
+            "bin_vidrio_full":   _bin(["bodegaVidrioLlena",   "bodega_vidrio_llena",   "bin_glass_full"],   "glass"),
+            "bin_metal_full":    _bin(["bodegaMetalLlena",    "bodega_metal_llena",    "bin_metal_full"],   "metal"),
             "smoke_alarm": smoke if smoke is not None else (bool(smoke_raw) if smoke_raw is not None else None),
-            "emergency": emergency,
-            "timestamp": timestamp,
+            "emergency":   emergency,
+            "timestamp":   timestamp,
         }
 
-    # Formato ya compatible
+    # ── Formato ya compatible ──────────────────────────────────────────────────
     normalized = dict(data)
     normalized["timestamp"] = _ensure_datetime(normalized.get("timestamp"))
     return normalized
 
+
+# ===============================
+# CALLBACKS MQTT
+# ===============================
+
 def on_connect(client, userdata, flags, rc, properties=None):
-    print("MQTT conectado")
+    print("[MQTT] Conectado")
 
     default_topics = [
         settings.MQTT_TOPIC_EVENTS,
@@ -358,32 +354,32 @@ def on_connect(client, userdata, flags, rc, properties=None):
 
     for topic in topics:
         client.subscribe(topic)
+        print(f"[MQTT] Suscrito a: {topic}")
+
 
 def on_message(client, userdata, msg):
     try:
-        topic = msg.topic
-        data = json.loads(msg.payload.decode())
-        kind = data.get("kind") if isinstance(data, dict) else None
+        topic: str           = msg.topic
+        raw                  = json.loads(msg.payload.decode())
+        data: dict[str, Any] = raw if isinstance(raw, dict) else {}
+        kind: str | None     = data.get("kind")
 
-        # ====== LOGGING DE DEBUG ======
         print("\n[MQTT-RX] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        print(f"[MQTT-RX] Topic: {topic}")
-        print(f"[MQTT-RX] Kind: {kind}")
-        payload_raw = msg.payload.decode()
-        print(f"[MQTT-RX] Payload size: {len(payload_raw)} bytes")
+        print(f"[MQTT-RX] Topic:            {topic}")
+        print(f"[MQTT-RX] Kind:             {kind}")
+        print(f"[MQTT-RX] Payload size:     {len(msg.payload)} bytes")
         print(f"[MQTT-RX] Has access_control: {isinstance(data.get('access_control'), dict)}")
-        print(f"[MQTT-RX] Has system_global: {isinstance(data.get('system_global'), dict)}")
-        print(f"[MQTT-RX] Has sorting_plant: {isinstance(data.get('sorting_plant'), dict)}")
+        print(f"[MQTT-RX] Has system_global:  {isinstance(data.get('system_global'),  dict)}")
+        print(f"[MQTT-RX] Has sorting_plant:  {isinstance(data.get('sorting_plant'),  dict)}")
         print("[MQTT-RX] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
-        # ====================================
 
-        # Topics canónicos
+        # ── Topics canónicos separados ─────────────────────────────────────────
+
         if topic == settings.MQTT_TOPIC_EVENTS:
-            if isinstance(data, dict):
-                data["timestamp"] = _ensure_datetime(data.get("timestamp"))
+            data["timestamp"] = _ensure_datetime(data.get("timestamp"))
             event = Event(**data)
-            doc = event.model_dump()
-            res = db.events.insert_one(doc)
+            doc   = event.model_dump()
+            res   = db.events.insert_one(doc)
             _log_mongo_insert("events", res.inserted_id, doc)
             process_kpi(doc)
             return
@@ -391,57 +387,52 @@ def on_message(client, userdata, msg):
         if topic == settings.MQTT_TOPIC_STATE:
             normalized = _normalize_state_payload(data)
             state = State(**normalized)
-            doc = state.model_dump()
-            res = db.state.insert_one(doc)
+            doc   = state.model_dump()
+            res   = db.state.insert_one(doc)
             _log_mongo_insert("state", res.inserted_id, doc)
             return
 
         if topic == settings.MQTT_TOPIC_ALERTS:
-            if isinstance(data, dict):
-                data["timestamp"] = _ensure_datetime(data.get("timestamp"))
+            data["timestamp"] = _ensure_datetime(data.get("timestamp"))
             alert = Alert(**data)
-            doc = alert.model_dump()
-            res = db.alerts.insert_one(doc)
+            doc   = alert.model_dump()
+            res   = db.alerts.insert_one(doc)
             _log_mongo_insert("alerts", res.inserted_id, doc)
             return
 
-        # Topic único (script Raspberry): enruta por `kind`
+        # ── Topic único Raspberry: enruta por `kind` ───────────────────────────
+
         if topic == settings.MQTT_TOPIC_EVENTOS:
-                        print(f"[MQTT-PRC] ► Procesando ecosort/eventos con kind='{kind}'")
-            
+            print(f"[MQTT-PRC] ► Procesando {topic} con kind='{kind}'")
+
             if kind == "alert":
-                if not isinstance(data, dict):
-                    raise ValueError("alert payload no es dict")
-                                print(f"[MQTT-OK] ✅ Alert guardada en alerts")
                 data["timestamp"] = _ensure_datetime(data.get("timestamp"))
                 alert = Alert(**data)
-                doc = alert.model_dump()
-                res = db.alerts.insert_one(doc)
+                doc   = alert.model_dump()
+                res   = db.alerts.insert_one(doc)
                 _log_mongo_insert("alerts", res.inserted_id, doc)
+                print("[MQTT-OK] ✅ Alert guardada en alerts")
                 return
 
             if kind == "event":
-                if not isinstance(data, dict):
-                    raise ValueError("event payload no es dict")
-                                print(f"[MQTT-OK] ✅ Event guardada en events")
                 data["timestamp"] = _ensure_datetime(data.get("timestamp"))
                 event = Event(**data)
-                doc = event.model_dump()
-                res = db.events.insert_one(doc)
+                doc   = event.model_dump()
+                res   = db.events.insert_one(doc)
                 _log_mongo_insert("events", res.inserted_id, doc)
                 process_kpi(doc)
+                print("[MQTT-OK] ✅ Event guardada en events")
                 return
 
-            # default: state
-                        print(f"[MQTT-PRC] ► Default to state (no era alert/event)")
-                        print(f"[MQTT-DBG] Antes normalize: parking? {isinstance(data.get('access_control'), dict)}")
-                        print(f"[MQTT-DBG] Después normalize: parking={len(normalized.get('parking', []))} elementos, door='{normalized.get('door')}'")
-                        print(f"[MQTT-OK] ✅ State guardada en state (parking={len(doc.get('parking', []))})")
+            # default → state
+            print("[MQTT-PRC] ► Default to state (no era alert/event)")
             normalized = _normalize_state_payload(data)
+            print(f"[MQTT-DBG] parking={len(normalized.get('parking', []))} slots, door='{normalized.get('door')}'")
             state = State(**normalized)
-            doc = state.model_dump()
-            res = db.state.insert_one(doc)
+            doc   = state.model_dump()
+            res   = db.state.insert_one(doc)
             _log_mongo_insert("state", res.inserted_id, doc)
+            print(f"[MQTT-OK] ✅ State guardada (parking={len(doc.get('parking', []))})")
             return
 
     except Exception as e:
@@ -449,6 +440,10 @@ def on_message(client, userdata, msg):
         import traceback
         traceback.print_exc()
 
+
+# ===============================
+# SETUP DEL CLIENTE
+# ===============================
 
 client = mqtt.Client()
 
@@ -462,9 +457,10 @@ if settings.MQTT_TLS:
 client.on_connect = on_connect
 client.on_message = on_message
 
+
 def start_mqtt():
     try:
         client.connect(settings.MQTT_BROKER, settings.MQTT_PORT, 60)
         client.loop_start()
     except Exception as exc:
-        print(f"Error iniciando MQTT: {exc}")
+        print(f"[MQTT-ERR] Error iniciando MQTT: {exc}")
