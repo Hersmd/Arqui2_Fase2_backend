@@ -6,9 +6,11 @@ from pymongo.errors import PyMongoError
 router = APIRouter()
 
 @router.get("/state/latest")
-def get_latest_state():
+def get_latest_state(debug_raw: bool = False):
     try:
+        print("[mongo] /state/latest -> ejecutando find_one(sort=[('timestamp', -1)])")
         state = db.state.find_one(sort=[("timestamp", -1)])
+        print(f"[mongo] /state/latest -> documento crudo recibido: {state}")
     except PyMongoError as exc:
         print(f"[mongo] /state/latest error: {type(exc).__name__}: {exc}")
         raise HTTPException(
@@ -17,6 +19,11 @@ def get_latest_state():
         ) from exc
     
     if state:
+        if debug_raw:
+            print("[mongo] /state/latest -> debug_raw=true, devolviendo documento sin defaults")
+            state["_id"] = str(state.get("_id"))
+            return state
+
         state.pop("_id", None)
 
         # Compatibilidad: documentos viejos pueden no tener todos los campos.

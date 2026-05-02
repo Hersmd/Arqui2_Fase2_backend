@@ -365,6 +365,18 @@ def on_message(client, userdata, msg):
         data = json.loads(msg.payload.decode())
         kind = data.get("kind") if isinstance(data, dict) else None
 
+        # ====== LOGGING DE DEBUG ======
+        print("\n[MQTT-RX] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"[MQTT-RX] Topic: {topic}")
+        print(f"[MQTT-RX] Kind: {kind}")
+        payload_raw = msg.payload.decode()
+        print(f"[MQTT-RX] Payload size: {len(payload_raw)} bytes")
+        print(f"[MQTT-RX] Has access_control: {isinstance(data.get('access_control'), dict)}")
+        print(f"[MQTT-RX] Has system_global: {isinstance(data.get('system_global'), dict)}")
+        print(f"[MQTT-RX] Has sorting_plant: {isinstance(data.get('sorting_plant'), dict)}")
+        print("[MQTT-RX] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+        # ====================================
+
         # Topics canónicos
         if topic == settings.MQTT_TOPIC_EVENTS:
             if isinstance(data, dict):
@@ -395,9 +407,12 @@ def on_message(client, userdata, msg):
 
         # Topic único (script Raspberry): enruta por `kind`
         if topic == settings.MQTT_TOPIC_EVENTOS:
+                        print(f"[MQTT-PRC] ► Procesando ecosort/eventos con kind='{kind}'")
+            
             if kind == "alert":
                 if not isinstance(data, dict):
                     raise ValueError("alert payload no es dict")
+                                print(f"[MQTT-OK] ✅ Alert guardada en alerts")
                 data["timestamp"] = _ensure_datetime(data.get("timestamp"))
                 alert = Alert(**data)
                 doc = alert.model_dump()
@@ -408,6 +423,7 @@ def on_message(client, userdata, msg):
             if kind == "event":
                 if not isinstance(data, dict):
                     raise ValueError("event payload no es dict")
+                                print(f"[MQTT-OK] ✅ Event guardada en events")
                 data["timestamp"] = _ensure_datetime(data.get("timestamp"))
                 event = Event(**data)
                 doc = event.model_dump()
@@ -417,6 +433,10 @@ def on_message(client, userdata, msg):
                 return
 
             # default: state
+                        print(f"[MQTT-PRC] ► Default to state (no era alert/event)")
+                        print(f"[MQTT-DBG] Antes normalize: parking? {isinstance(data.get('access_control'), dict)}")
+                        print(f"[MQTT-DBG] Después normalize: parking={len(normalized.get('parking', []))} elementos, door='{normalized.get('door')}'")
+                        print(f"[MQTT-OK] ✅ State guardada en state (parking={len(doc.get('parking', []))})")
             normalized = _normalize_state_payload(data)
             state = State(**normalized)
             doc = state.model_dump()
@@ -425,7 +445,9 @@ def on_message(client, userdata, msg):
             return
 
     except Exception as e:
-        print("Error procesando MQTT:", e)
+        print(f"[MQTT-ERR] ❌ {type(e).__name__}: {e}")
+        import traceback
+        traceback.print_exc()
 
 
 client = mqtt.Client()
